@@ -20,6 +20,14 @@ streamlit run app.py
 
 The app creates `hvac_board.db` automatically on first launch.
 
+## ServiceTitan API (Past Scheduled Jobs)
+
+1. Copy `.streamlit/secrets.toml.example` → `.streamlit/secrets.toml`
+2. Fill in `client_id`, `client_secret`, `app_key`, and `tenant_id`
+3. Restart Streamlit, open **Past Scheduled Jobs**, click **Test ST connection**, then **Pull past scheduled jobs from ST**
+
+CSV import remains available as a backup if API access is delayed.
+
 ## Deploy on Streamlit Community Cloud (free)
 
 1. Push this repo to GitHub (`ceilingxfan/hvac-dispatch`)

@@ -3,6 +3,8 @@ import pandas as pd
 import sqlite3
 from datetime import datetime, timedelta
 
+import servicetitan as st_api
+
 # Page Setup
 st.set_page_config(layout="wide", page_title="Beola the 3 Day Board")
 
@@ -57,13 +59,33 @@ def init_db():
             phone TEXT,
             job_type TEXT,
             notes TEXT,
-            status TEXT
+            status TEXT,
+            scheduled_date TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Past_Scheduled_Jobs (
+            id TEXT PRIMARY KEY,
+            job_number TEXT,
+            customer_name TEXT,
+            scheduled_date TEXT,
+            job_type TEXT,
+            technician TEXT,
+            status TEXT,
+            notes TEXT,
+            source TEXT,
+            imported_at TEXT,
+            resolved INTEGER DEFAULT 0
         )
     """)
     
-    # Safe schema migration for older DB files to add the new is_standby column
+    # Safe schema migration for older DB files
     try:
         cursor.execute("ALTER TABLE Booking_Log ADD COLUMN is_standby INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE Maintenance_Waitlist ADD COLUMN scheduled_date TEXT")
     except sqlite3.OperationalError:
         pass
         
@@ -94,22 +116,41 @@ PRIORITY_STYLES = {
     "Low": {"bg": "#ABFA00", "text": "#1e293b", "label": "🟢 LOW"},
 }
 REPAIR_JOB_COLOR = {"bg": "#2563eb", "text": "#ffffff", "label": "🔧 REPAIR"}
-JOB_STATUSES = ["Booked", "Scheduled", "Dispatched", "Completed", "Rescheduled", "Cancelled"]
-BOARD_HIDDEN_STATUSES = {"Cancelled", "Rescheduled"}
+JOB_STATUSES = ["Booked", "Scheduled", "Dispatched", "Completed", "Hold", "Rescheduled", "Cancelled"]
+BOARD_HIDDEN_STATUSES = {"Cancelled", "Rescheduled", "Hold"}
+# Holds reserve capacity without showing on the live crew board
+CAPACITY_EXCLUDED_STATUSES = {"Cancelled", "Rescheduled", "Completed"}
 
 def is_on_board(status):
     return status not in BOARD_HIDDEN_STATUSES
 
+def counts_toward_capacity_status(status):
+    return status not in CAPACITY_EXCLUDED_STATUSES
+
+def exclude_standby_jobs(df):
+    """Standby entries belong on the Move-Up Queue, not dispatch Unassigned / crew boards."""
+    if df.empty or "is_standby" not in df.columns:
+        return df
+    return df[df["is_standby"].fillna(0).astype(int) != 1]
+
 def filter_board_jobs(df):
     if df.empty:
         return df
-    return df[df["status"].apply(is_on_board)]
+    return exclude_standby_jobs(df[df["status"].apply(is_on_board)])
+
+def filter_capacity_jobs(df):
+    """Jobs that reserve board capacity (includes Hold; excludes standby waitlist jobs)."""
+    if df.empty:
+        return df
+    return exclude_standby_jobs(df[df["status"].apply(counts_toward_capacity_status)])
 
 def get_future_bookings(df, after_date):
     """Active bookings scheduled beyond the rolling 3-day board window."""
     if df.empty:
         return df
-    future = df[(df["date"] > after_date) & df["status"].apply(is_on_board)].copy()
+    future = exclude_standby_jobs(
+        df[(df["date"] > after_date) & df["status"].apply(is_on_board)]
+    ).copy()
     return future.sort_values(["date", "customer_job"])
 
 def get_job_card_colors(job, *, is_unassigned=False):
@@ -401,6 +442,32 @@ def get_3_continuous_days(start_date):
 today = datetime.today().date()
 day1, day2, day3 = get_3_continuous_days(today)
 
+def select_board_day(key, *, style="radio", label="Board day"):
+    """Day picker that keeps the selected day after save/rerun (st.tabs always reset to Day 1)."""
+    days = [day1, day2, day3]
+    radio_labels = [
+        f"📅 Day 1 · {day1.strftime('%a %b %d')}",
+        f"📆 Day 2 · {day2.strftime('%a %b %d')}",
+        f"🗓️ Day 3 · {day3.strftime('%a %b %d')}",
+    ]
+    if style == "selectbox":
+        idx = st.selectbox(
+            label,
+            options=[0, 1, 2],
+            format_func=lambda i: days[i].strftime("%A, %b %d"),
+            key=key,
+        )
+    else:
+        idx = st.radio(
+            label,
+            options=[0, 1, 2],
+            format_func=lambda i: radio_labels[i],
+            horizontal=True,
+            key=key,
+            label_visibility="collapsed",
+        )
+    return days[idx], idx + 1
+
 render_beola_title()
 
 st.markdown(get_schedule_grid_css() + get_crew_header_css() + get_grid_header_css(), unsafe_allow_html=True)
@@ -448,7 +515,104 @@ def load_waitlist():
     conn = get_db_connection()
     df = pd.read_sql_query("SELECT * FROM Maintenance_Waitlist WHERE status = 'Active'", conn)
     conn.close()
+    if not df.empty and "scheduled_date" in df.columns:
+        df["scheduled_date"] = pd.to_datetime(df["scheduled_date"], errors="coerce").dt.date
     return df
+
+def load_past_scheduled_jobs(*, include_resolved=False):
+    conn = get_db_connection()
+    if include_resolved:
+        df = pd.read_sql_query("SELECT * FROM Past_Scheduled_Jobs ORDER BY scheduled_date DESC", conn)
+    else:
+        df = pd.read_sql_query(
+            "SELECT * FROM Past_Scheduled_Jobs WHERE resolved = 0 ORDER BY scheduled_date DESC",
+            conn,
+        )
+    conn.close()
+    if not df.empty and "scheduled_date" in df.columns:
+        df["scheduled_date"] = pd.to_datetime(df["scheduled_date"], errors="coerce").dt.date
+    return df
+
+def get_board_past_incomplete_jobs(bookings):
+    """Local board jobs scheduled before today that were never completed/cancelled."""
+    if bookings.empty:
+        return bookings
+    open_statuses = {"Booked", "Scheduled", "Dispatched"}
+    past = exclude_standby_jobs(bookings)
+    past = past[
+        (past["date"] < today) &
+        (past["status"].isin(open_statuses))
+    ].copy()
+    return past.sort_values(["date", "customer_job"])
+
+def find_bookings(query, bookings):
+    """Case-insensitive search across customer/job, notes, tech, status, date."""
+    q = (query or "").strip().lower()
+    if not q or bookings.empty:
+        return bookings.iloc[0:0]
+    searchable = bookings.copy()
+    searchable["_blob"] = (
+        searchable["customer_job"].astype(str) + " " +
+        searchable["notes"].fillna("").astype(str) + " " +
+        searchable["technician"].astype(str) + " " +
+        searchable["status"].astype(str) + " " +
+        searchable["job_type"].astype(str) + " " +
+        searchable["date"].astype(str) + " " +
+        searchable["id"].astype(str)
+    ).str.lower()
+    return searchable[searchable["_blob"].str.contains(q, regex=False)].drop(columns=["_blob"])
+
+def _match_csv_column(columns, *candidates):
+    lowered = {str(c).strip().lower(): c for c in columns}
+    for cand in candidates:
+        if cand in lowered:
+            return lowered[cand]
+    for col_lower, col in lowered.items():
+        for cand in candidates:
+            if cand in col_lower:
+                return col
+    return None
+
+def normalize_past_jobs_csv(uploaded_df):
+    """Map common ServiceTitan export column names into Past_Scheduled_Jobs fields."""
+    import hashlib
+
+    job_col = _match_csv_column(uploaded_df.columns, "job #", "job number", "job#", "job id", "job")
+    cust_col = _match_csv_column(uploaded_df.columns, "customer name", "customer", "location name", "location")
+    date_col = _match_csv_column(
+        uploaded_df.columns,
+        "appointment date", "scheduled date", "job start date", "first appt date",
+        "last appt date", "start date", "appt date", "scheduled on",
+    )
+    type_col = _match_csv_column(uploaded_df.columns, "job type", "type")
+    tech_col = _match_csv_column(uploaded_df.columns, "technician", "tech", "assigned technician")
+    status_col = _match_csv_column(uploaded_df.columns, "job status", "status", "appointment status")
+    notes_col = _match_csv_column(uploaded_df.columns, "notes", "summary", "description", "address")
+
+    rows = []
+    for i, row in uploaded_df.iterrows():
+        job_number = str(row[job_col]).strip() if job_col else ""
+        customer = str(row[cust_col]).strip() if cust_col else ""
+        if (not job_number or job_number.lower() == "nan") and (not customer or customer.lower() == "nan"):
+            continue
+        raw_date = row[date_col] if date_col else None
+        parsed_date = pd.to_datetime(raw_date, errors="coerce")
+        scheduled = parsed_date.date().isoformat() if pd.notna(parsed_date) else ""
+        job_number = job_number if job_number.lower() != "nan" else ""
+        customer = customer if customer.lower() != "nan" else ""
+        stable_key = f"{job_number}|{customer}|{scheduled}|{i}"
+        row_id = "st-" + hashlib.md5(stable_key.encode("utf-8")).hexdigest()[:16]
+        rows.append({
+            "id": row_id,
+            "job_number": job_number,
+            "customer_name": customer,
+            "scheduled_date": scheduled,
+            "job_type": str(row[type_col]).strip() if type_col and pd.notna(row[type_col]) else "",
+            "technician": str(row[tech_col]).strip() if tech_col and pd.notna(row[tech_col]) else "",
+            "status": str(row[status_col]).strip() if status_col and pd.notna(row[status_col]) else "Scheduled",
+            "notes": str(row[notes_col]).strip() if notes_col and pd.notna(row[notes_col]) else "",
+        })
+    return pd.DataFrame(rows)
 
 bookings_df = load_bookings()
 roster_df = load_roster()
@@ -712,13 +876,14 @@ def get_detailed_metrics(target_date):
     priority_counts = {"Urgent": 0, "High": 0, "Normal": 0, "Low": 0}
     
     if not bookings_df.empty:
-        active_jobs = filter_board_jobs(bookings_df[bookings_df['date'] == target_date])
+        active_jobs = filter_capacity_jobs(bookings_df[bookings_df['date'] == target_date])
         
         for _, job in active_jobs.iterrows():
             if not job_counts_toward_capacity(job):
                 continue
             total_jobs_booked += 1
-            if job['priority_level'] in priority_counts and not job['is_recall']:
+            # Holds reserve hours/slots but do not fill priority tier allotments yet
+            if job["status"] != "Hold" and job['priority_level'] in priority_counts and not job['is_recall']:
                 priority_counts[job['priority_level']] += 1
                 
             if not job['is_recall']:
@@ -960,8 +1125,50 @@ def render_tech_slot_grid(tech_jobs, *, is_unassigned=False):
 # -------------------------------------------------------------
 # NAVIGATION SIDEBAR HUB
 # -------------------------------------------------------------
-view = st.sidebar.radio("Navigate Department Hub:", ["CSR Booking & Standby Hub", "Parts & Repairs Hub", "Dispatch Operational Desk", "Live Summary Board"])
+view = st.sidebar.radio(
+    "Navigate Department Hub:",
+    [
+        "CSR Booking & Standby Hub",
+        "Parts & Repairs Hub",
+        "Dispatch Operational Desk",
+        "Live Summary Board",
+        "Past Scheduled Jobs",
+    ],
+)
 st.sidebar.markdown("---")
+search_query = st.sidebar.text_input(
+    "🔍 Search jobs / customers",
+    placeholder="Name, job #, tech, notes…",
+    key="global_job_search",
+)
+if search_query.strip():
+    search_hits = find_bookings(search_query, bookings_df)
+    st.sidebar.caption(f"{len(search_hits)} match(es) on this board")
+else:
+    search_hits = bookings_df.iloc[0:0]
+
+if search_query.strip():
+    with st.expander(f"🔍 Search results for “{search_query.strip()}” ({len(search_hits)})", expanded=True):
+        if search_hits.empty:
+            st.info("No matching jobs found on this board.")
+        else:
+            st.dataframe(
+                search_hits[
+                    ["date", "customer_job", "technician", "status", "priority_level", "timeframe", "job_type", "notes"]
+                ],
+                column_config={
+                    "date": st.column_config.DateColumn("Date", format="MM/DD/YYYY"),
+                    "customer_job": st.column_config.TextColumn("Customer / Job"),
+                    "technician": st.column_config.TextColumn("Technician"),
+                    "status": st.column_config.TextColumn("Status"),
+                    "priority_level": st.column_config.TextColumn("Priority"),
+                    "timeframe": st.column_config.TextColumn("Slot"),
+                    "job_type": st.column_config.TextColumn("Job Type"),
+                    "notes": st.column_config.TextColumn("Notes", width="large"),
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
 
 # -------------------------------------------------------------
 # 1. CSR BOOKING & STANDBY HUB
@@ -980,6 +1187,11 @@ if view == "CSR Booking & Standby Hub":
     ])
     
     with tab_booking:
+        st.info(
+            "📌 **Maintenance that needs to be moved up?** "
+            "Open the **⚡ Move-Up Standby Queue** tab (or check **Add to Move-Up Standby Queue only**). "
+            "Those requests stay on the standby list and will **not** show as Unassigned on dispatch."
+        )
         cols = st.columns(3)
         for i, d in enumerate([day1, day2, day3]):
             metrics = get_detailed_metrics(d)
@@ -1054,7 +1266,12 @@ if view == "CSR Booking & Standby Hub":
                 pre_coll = st.selectbox("Precollection Flag", precollect_opts)
                 is_rec = st.checkbox("Is this a Recall? (Bypasses hour capacities & priority limits ⚠️)")
                 m_override = st.checkbox("🚨 Apply Manager Cap Override? (Bypasses urgency tier limits 🛠️)")
-                add_to_standby = st.checkbox("Add to Move-Up Standby Queue? 📋")
+                add_to_standby = st.checkbox(
+                    "Add to Move-Up Standby Queue only? 📋",
+                    help="Puts this request on the Standby list only — it will NOT appear as Unassigned on the dispatch board.",
+                )
+                if add_to_standby:
+                    st.caption("Standby = waitlist only. Dispatch will pull it forward from the Move-Up Queue when a slot opens.")
 
                 if req_time_check:
                     st.caption("⏰ [TIME REQUEST] will be added to the front of your notes on submit. Add the time detail after the colon.")
@@ -1080,6 +1297,46 @@ if view == "CSR Booking & Standby Hub":
                 
                 if not cust_info:
                     st.error("You must enter a Customer Name or Job Number.")
+                elif add_to_standby:
+                    # Standby = Move-Up Queue only — never lands on dispatch Unassigned
+                    processed_notes = prepend_time_request_tag(notes_field) if req_time_check else notes_field
+                    if lace_book_check:
+                        processed_notes = append_lace_book_tag(processed_notes)
+                    if m_override:
+                        processed_notes = f"[MANAGER OVERRIDE APPLIED] {processed_notes}"
+
+                    standby_id = str(int(datetime.now().timestamp()))
+                    standby_tags = []
+                    if job_class == "Member":
+                        standby_tags.append("[MEMBER]")
+                    if p_level == "Urgent":
+                        standby_tags.append("[URGENT]")
+                    tag_str = " ".join(standby_tags)
+                    compiled_job_type = f"{job_class} Call {tag_str}".strip()
+                    wait_notes = processed_notes or ""
+                    if time_frame:
+                        wait_notes = f"Preferred window: {time_frame}. {wait_notes}".strip()
+
+                    conn = get_db_connection()
+                    conn.execute("""
+                        INSERT INTO Maintenance_Waitlist (id, timestamp, customer_name, phone, job_type, notes, status, scheduled_date)
+                        VALUES (?, ?, ?, ?, ?, ?, 'Active', ?)
+                    """, (
+                        standby_id,
+                        datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        cust_info,
+                        "",
+                        compiled_job_type,
+                        wait_notes,
+                        str(final_date),
+                    ))
+                    conn.commit()
+                    conn.close()
+                    st.session_state.flash_success = (
+                        f"'{cust_info}' added to Move-Up Standby Queue only "
+                        f"(not placed on the dispatch board)."
+                    )
+                    st.rerun()
                 elif is_board_maxed_out:
                     st.session_state.flash_error = "🛑 BOARD SOLD OUT! Technicians have reached their safe daily run capacity."
                     st.rerun()
@@ -1102,38 +1359,60 @@ if view == "CSR Booking & Standby Hub":
                     conn.execute("""
                         INSERT INTO Booking_Log (id, timestamp, date, customer_job, priority_level, timeframe, hours_needed, job_type, precollection, technician, is_recall, status, notes, booked_by, is_standby)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (unique_id, datetime.now().strftime("%Y-%m-%d %H:%M"), str(final_date), cust_info, p_level, time_frame, hours_est, job_class, pre_coll, "Unassigned", 1 if is_rec else 0, "Booked", processed_notes, "CSR Desk", 1 if add_to_standby else 0))
-                    
-                    if add_to_standby:
-                        standby_id = str(int(datetime.now().timestamp()) + 1)
-                        standby_tags = []
-                        if job_class == "Member": standby_tags.append("[MEMBER]")
-                        if p_level == "Urgent": standby_tags.append("[URGENT]")
-                        standby_tag_str = " ".join(standby_tags)
-                        compiled_job_type = f"{job_class} Call {standby_tag_str}".strip()
-                        
-                        conn.execute("""
-                            INSERT INTO Maintenance_Waitlist (id, timestamp, customer_name, phone, job_type, notes, status)
-                            VALUES (?, ?, ?, ?, ?, ?, 'Active')
-                        """, (standby_id, datetime.now().strftime("%Y-%m-%d %H:%M"), cust_info, "See Schedule", compiled_job_type, f"Auto-linked from booking entry. Notes: {processed_notes}"))
+                    """, (unique_id, datetime.now().strftime("%Y-%m-%d %H:%M"), str(final_date), cust_info, p_level, time_frame, hours_est, job_class, pre_coll, "Unassigned", 1 if is_rec else 0, "Booked", processed_notes, "CSR Desk", 0))
                     
                     conn.commit()
                     conn.close()
                     
-                    success_msg = f"Call for '{cust_info}' successfully committed to the board!"
-                    if add_to_standby:
-                        success_msg += " (Also populated on Move-Up Standby Queue)"
-                    st.session_state.flash_success = success_msg
+                    st.session_state.flash_success = f"Call for '{cust_info}' successfully committed to the board!"
                     st.rerun()
 
     with tab_standby:
         st.subheader("📋 Catchall Move-Up Standby Queue")
-        
+        st.caption(
+            "Waitlist only — these do **not** appear as Unassigned on the dispatch board. "
+            "When the day is slow, pull a job forward from here into a real board booking."
+        )
+
+        st.markdown("#### Add Standalone Request to Standby Queue")
+        with st.form("waitlist_form", clear_on_submit=True):
+            wc1, wc2 = st.columns(2)
+            with wc1:
+                w_name = st.text_input("Customer Name / Location")
+                w_scheduled = st.date_input("Current Scheduled Date", value=today + timedelta(days=7))
+                w_type = st.selectbox("Job Type Base", ["Service Call", "Maintenance Clean & Check", "Filter Run", "System Performance Inspection"])
+            with wc2:
+                w_member = st.checkbox("Is Member? ⭐")
+                w_urgent = st.checkbox("Is Urgent? 🚨")
+                w_notes = st.text_area("Customer Availability Notes")
+
+            if st.form_submit_button("Log on Standby Board"):
+                if not w_name:
+                    st.error("Customer name is required.")
+                else:
+                    w_id = str(int(datetime.now().timestamp()))
+                    tags = []
+                    if w_member: tags.append("[MEMBER]")
+                    if w_urgent: tags.append("[URGENT]")
+                    tag_str = " ".join(tags)
+                    final_w_type = f"{w_type} {tag_str}".strip()
+
+                    conn = get_db_connection()
+                    conn.execute("""
+                        INSERT INTO Maintenance_Waitlist (id, timestamp, customer_name, phone, job_type, notes, status, scheduled_date)
+                        VALUES (?, ?, ?, ?, ?, ?, 'Active', ?)
+                    """, (w_id, datetime.now().strftime("%Y-%m-%d %H:%M"), w_name, "", final_w_type, w_notes, str(w_scheduled)))
+                    conn.commit()
+                    conn.close()
+
+                    st.session_state.flash_success = f"{w_name} successfully added to the Move-Up Standby Queue."
+                    st.rerun()
+
+        st.markdown("---")
         waitlist_df = load_waitlist()
         if waitlist_df.empty:
             st.info("The standby move-up queue is currently clear.")
         else:
-            # Sort: URGENT first, then by timestamp
             def standby_sort_key(row):
                 urgent = 0 if "[URGENT]" in str(row.get("job_type", "")) else 1
                 member = 0 if "[MEMBER]" in str(row.get("job_type", "")) else 1
@@ -1155,7 +1434,13 @@ if view == "CSR Booking & Standby Hub":
                     badge += "<span style='background:#1d4ed8;color:white;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;margin-right:4px;'>⭐ MEMBER</span>"
                 clean_type = jtype.replace("[URGENT]", "").replace("[MEMBER]", "").strip()
                 ts = str(row.get("timestamp", ""))[:16]
-                phone = str(row.get("phone", "")) or "—"
+                sched = row.get("scheduled_date")
+                if pd.isna(sched) or sched is None or str(sched).strip() in ("", "NaT", "None"):
+                    sched_display = "—"
+                elif hasattr(sched, "strftime"):
+                    sched_display = sched.strftime("%a %m/%d/%Y")
+                else:
+                    sched_display = str(sched)
                 notes = str(row.get("notes", "")) or "—"
                 if is_urgent:
                     row_bg = theme["table_row_urgent"]
@@ -1166,7 +1451,7 @@ if view == "CSR Booking & Standby Hub":
                 rows_html += f"""
                 <tr style="background:{row_bg}; border-bottom:1px solid {theme['table_border']}; color:{theme['text']};">
                     <td style="padding:10px 12px; font-weight:600; white-space:nowrap;">{row['customer_name']}</td>
-                    <td style="padding:10px 12px;">{phone}</td>
+                    <td style="padding:10px 12px; white-space:nowrap;">{sched_display}</td>
                     <td style="padding:10px 12px;">{clean_type}<br>{badge}</td>
                     <td style="padding:10px 12px; font-size:12px; color:{theme['text_secondary']}; max-width:220px;">{notes}</td>
                     <td style="padding:10px 12px; font-size:12px; color:{theme['text_muted']}; white-space:nowrap;">{ts}</td>
@@ -1178,7 +1463,7 @@ if view == "CSR Booking & Standby Hub":
                         <thead>
                             <tr style="background:{theme['table_header']}; color:{theme['table_header_text']};">
                                 <th style="padding:10px 12px; text-align:left; font-weight:600;">Customer</th>
-                                <th style="padding:10px 12px; text-align:left; font-weight:600;">Phone</th>
+                                <th style="padding:10px 12px; text-align:left; font-weight:600;">Current Scheduled Date</th>
                                 <th style="padding:10px 12px; text-align:left; font-weight:600;">Job Type</th>
                                 <th style="padding:10px 12px; text-align:left; font-weight:600;">Notes</th>
                                 <th style="padding:10px 12px; text-align:left; font-weight:600;">Logged At</th>
@@ -1193,7 +1478,7 @@ if view == "CSR Booking & Standby Hub":
             with st.form("complete_standby_form"):
                 options_map = {f"{row['customer_name']} — {str(row['job_type']).replace('[URGENT]','').replace('[MEMBER]','').strip()}": row['id'] for _, row in waitlist_sorted.iterrows()}
                 selected_option = st.selectbox("Select entry to complete / remove:", options=list(options_map.keys()))
-                
+
                 if st.form_submit_button("✅ Mark as Completed"):
                     target_id = options_map[selected_option]
                     conn = get_db_connection()
@@ -1201,42 +1486,6 @@ if view == "CSR Booking & Standby Hub":
                     conn.commit()
                     conn.close()
                     st.session_state.flash_success = f"Standby entry '{selected_option}' marked as completed."
-                    st.rerun()
-                    
-        st.markdown("---")
-        st.subheader("Add Standalone Request to Standby Queue")
-        with st.form("waitlist_form", clear_on_submit=True):
-            wc1, wc2 = st.columns(2)
-            with wc1:
-                w_name = st.text_input("Customer Name / Location")
-                w_phone = st.text_input("Contact Phone Number")
-                w_type = st.selectbox("Job Type Base", ["Service Call", "Maintenance Clean & Check", "Filter Run", "System Performance Inspection"])
-            with wc2:
-                w_member = st.checkbox("Is Member? ⭐")
-                w_urgent = st.checkbox("Is Urgent? 🚨")
-                w_notes = st.text_area("Customer Availability Notes")
-                
-            if st.form_submit_button("Log on Standby Board"):
-                if not w_name:
-                    st.error("Customer name is required.")
-                else:
-                    w_id = str(int(datetime.now().timestamp()))
-                    
-                    tags = []
-                    if w_member: tags.append("[MEMBER]")
-                    if w_urgent: tags.append("[URGENT]")
-                    tag_str = " ".join(tags)
-                    final_w_type = f"{w_type} {tag_str}".strip()
-                    
-                    conn = get_db_connection()
-                    conn.execute("""
-                        INSERT INTO Maintenance_Waitlist (id, timestamp, customer_name, phone, job_type, notes, status)
-                        VALUES (?, ?, ?, ?, ?, ?, 'Active')
-                    """, (w_id, datetime.now().strftime("%Y-%m-%d %H:%M"), w_name, w_phone, final_w_type, w_notes))
-                    conn.commit()
-                    conn.close()
-                    
-                    st.session_state.flash_success = f"{w_name} successfully added to the Move-Up Standby Queue."
                     st.rerun()
 
     with tab_future:
@@ -1281,7 +1530,11 @@ if view == "CSR Booking & Standby Hub":
 # -------------------------------------------------------------
 elif view == "Parts & Repairs Hub":
     st.header("📦 Parts Coordination & Special Repair Scheduler")
-    
+    st.caption(
+        "Use **Place on Hold** to reserve capacity while waiting on customer confirmation. "
+        "Holds stay off the live dispatch board until you set status to **Booked** or **Scheduled**."
+    )
+
     with st.form("parts_booking_form", clear_on_submit=True):
         col_p1, col_p2 = st.columns(2)
         with col_p1:
@@ -1303,9 +1556,15 @@ elif view == "Parts & Repairs Hub":
                 parts_form_tech_options,
                 help="Techs marked OUT are not listed. Availability follows the Call-Out Board.",
             )
+            p_booking_mode = st.radio(
+                "Booking mode",
+                ["Lock in now (Scheduled)", "Place on Hold (reserve space)"],
+                horizontal=True,
+                help="Hold reserves AM/PM capacity for that day but stays off the live crew board until confirmed.",
+            )
             p_notes = st.text_area("Parts / PO Details & Requirements")
-            
-        if st.form_submit_button("Lock In Repair Booking"):
+
+        if st.form_submit_button("Save Repair Entry"):
             if not p_cust:
                 st.error("Customer field is required.")
             else:
@@ -1313,21 +1572,115 @@ elif view == "Parts & Repairs Hub":
                 assignable = get_assignable_tech_options(final_date, [p_assigned_tech])
                 assigned_tech = p_assigned_tech if p_assigned_tech in assignable else "Unassigned"
                 unique_id = str(int(datetime.now().timestamp()))
-                
+                is_hold = "Hold" in p_booking_mode
+                save_status = "Hold" if is_hold else "Scheduled"
+                note_prefix = "⏸️ PARTS HOLD:" if is_hold else "🔧 PARTS REPAIR:"
+
                 conn = get_db_connection()
                 conn.execute("""
                     INSERT INTO Booking_Log (id, timestamp, date, customer_job, priority_level, timeframe, hours_needed, job_type, precollection, technician, is_recall, status, notes, booked_by, is_standby)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (unique_id, datetime.now().strftime("%Y-%m-%d %H:%M"), str(final_date), p_cust, "Normal", p_timeframe, p_hours, "Special Repair", "Not Applicable", assigned_tech, 0, "Scheduled", f"🔧 PARTS REPAIR: {p_notes}", "Parts Coordination", 0))
+                """, (unique_id, datetime.now().strftime("%Y-%m-%d %H:%M"), str(final_date), p_cust, "Normal", p_timeframe, p_hours, "Special Repair", "Not Applicable", assigned_tech, 0, save_status, f"{note_prefix} {p_notes}", "Parts Coordination", 0))
                 conn.commit()
                 conn.close()
-                
-                st.session_state.flash_success = f"Special Repair booked and assigned to {assigned_tech}."
+
+                if is_hold:
+                    st.session_state.flash_success = (
+                        f"Repair hold placed for '{p_cust}' on {final_date.strftime('%a %m/%d')} — "
+                        f"capacity reserved. Confirm from On Hold below when ready."
+                    )
+                else:
+                    st.session_state.flash_success = f"Special Repair booked and assigned to {assigned_tech}."
                 st.rerun()
 
     st.markdown("---")
-    st.subheader("📋 Your Submitted Repair Bookings")
-    st.caption("Review and update repair jobs entered through this hub. Changes save to the dispatch board.")
+    st.subheader("⏸️ On Hold — awaiting customer confirmation")
+    st.caption(
+        "Change **Held Date** if that day does not work for the customer. "
+        "Set **Status** to **Booked** or **Scheduled** to commit onto the live dispatch board."
+    )
+
+    if not bookings_df.empty:
+        hold_jobs = bookings_df[
+            (bookings_df["job_type"] == "Special Repair") &
+            (bookings_df["status"] == "Hold")
+        ].copy()
+    else:
+        hold_jobs = pd.DataFrame()
+
+    if hold_jobs.empty:
+        st.info("No repairs currently on hold.")
+    else:
+        hold_jobs = hold_jobs.sort_values(["date", "customer_job"])
+        hold_tech_options = ["Unassigned"]
+        for _, row in hold_jobs.iterrows():
+            hold_tech_options.extend(get_assignable_tech_options(row["date"], [row["technician"]]))
+        hold_tech_options = list(dict.fromkeys(hold_tech_options))
+        hold_display_cols = ["id", "date", "customer_job", "timeframe", "hours_needed", "technician", "status", "notes"]
+        hold_editor = st.data_editor(
+            hold_jobs[hold_display_cols],
+            column_config={
+                "id": None,
+                "date": st.column_config.DateColumn(
+                    "Held Date",
+                    format="MM/DD/YYYY",
+                    help="Change this if the original hold date does not work for the customer.",
+                ),
+                "customer_job": st.column_config.TextColumn("Customer / Job"),
+                "timeframe": st.column_config.SelectboxColumn(
+                    "Slot",
+                    options=["All Day", "AM 1", "AM 2", "PM 1", "PM 2", "AM", "PM", "Open"],
+                ),
+                "hours_needed": st.column_config.SelectboxColumn(
+                    "Duration (hrs)",
+                    options=[2, 4, 6, 8],
+                ),
+                "technician": st.column_config.SelectboxColumn("Technician", options=hold_tech_options),
+                "status": st.column_config.SelectboxColumn(
+                    "Status",
+                    options=["Hold", "Booked", "Scheduled", "Cancelled"],
+                    help="Booked or Scheduled commits this hold onto the live board.",
+                ),
+                "notes": st.column_config.TextColumn("Parts / PO Notes", width="large"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="parts_hold_editor",
+        )
+
+        if st.button("💾 Save Hold Updates", type="primary", key="save_parts_holds"):
+            conn = get_db_connection()
+            confirmed = 0
+            for _, row in hold_editor.iterrows():
+                target_date = row["date"]
+                if hasattr(target_date, "date"):
+                    target_date = target_date.date()
+                assignable = get_assignable_tech_options(target_date, [row["technician"]])
+                tech = row["technician"] if row["technician"] in assignable else "Unassigned"
+                notes = row["notes"]
+                if row["status"] in ("Booked", "Scheduled") and isinstance(notes, str):
+                    notes = notes.replace("⏸️ PARTS HOLD:", "🔧 PARTS REPAIR:", 1)
+                if row["status"] in ("Booked", "Scheduled"):
+                    confirmed += 1
+                conn.execute(
+                    """UPDATE Booking_Log SET date = ?, customer_job = ?, timeframe = ?, hours_needed = ?,
+                       technician = ?, status = ?, notes = ? WHERE id = ?""",
+                    (
+                        str(target_date), row["customer_job"], row["timeframe"], int(row["hours_needed"]),
+                        tech, row["status"], notes, str(row["id"]),
+                    ),
+                )
+            conn.commit()
+            conn.close()
+            msg = "Hold updates saved."
+            if confirmed:
+                msg += f" {confirmed} job(s) committed to the live board."
+            st.session_state.flash_success = msg
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("📋 Active Repair Bookings (on the board)")
+    st.caption("Confirmed Special Repair jobs currently on the dispatch board.")
 
     if not bookings_df.empty:
         parts_jobs = bookings_df[
@@ -1338,7 +1691,7 @@ elif view == "Parts & Repairs Hub":
         parts_jobs = pd.DataFrame()
 
     if parts_jobs.empty:
-        st.info("No active repair bookings on file yet.")
+        st.info("No active repair bookings on the board yet.")
     else:
         parts_jobs = parts_jobs.sort_values(["date", "customer_job"])
         parts_tech_options = ["Unassigned"]
@@ -1410,20 +1763,28 @@ elif view == "Dispatch Operational Desk":
                     for _, u_job in day2_urgents.iterrows():
                         st.markdown(f"* **{u_job['customer_job']}** ({u_job['timeframe']} window) | Notes: *{u_job['notes']}*")
                         
-    t_routing, t_reschedule, t_future, t_callout, t_blackout = st.tabs([
+    DISPATCH_DESK_SECTIONS = [
         "Active 3-Day Routing Matrix",
         "📅 Reschedule Queue",
         "🔮 Future Jobs Board",
         "🚫 Call-Out Board",
         "Tech Attendance & Availability",
-    ])
-    
-    with t_callout:
+    ]
+    desk_tab = st.radio(
+        "Dispatch desk section",
+        DISPATCH_DESK_SECTIONS,
+        horizontal=True,
+        key="dispatch_desk_tab",
+        label_visibility="collapsed",
+    )
+    st.caption("Selected section stays put when you change dates or save.")
+
+    if desk_tab == "🚫 Call-Out Board":
         st.subheader("🚫 Crew Call-Out & Availability Board")
         st.caption("Live view of dispatcher attendance changes across the 3-day window. Update entries in **Tech Attendance & Availability**.")
         render_callout_board([day1, day2, day3])
 
-    with t_reschedule:
+    if desk_tab == "📅 Reschedule Queue":
         st.subheader("📅 Reschedule Queue")
         st.caption("Jobs marked **Rescheduled** are held here until you assign a new day and set status back to **Booked**.")
 
@@ -1493,7 +1854,7 @@ elif view == "Dispatch Operational Desk":
                     st.session_state.flash_success = "Reschedule queue updated."
                     st.rerun()
 
-    with t_future:
+    if desk_tab == "🔮 Future Jobs Board":
         st.subheader("🔮 Future Jobs Board")
         st.caption(
             f"Edit bookings scheduled after **{day3.strftime('%A, %b %d')}**. "
@@ -1562,7 +1923,7 @@ elif view == "Dispatch Operational Desk":
                 st.session_state.flash_success = "Future job board updated."
                 st.rerun()
     
-    with t_blackout:
+    if desk_tab == "Tech Attendance & Availability":
         st.subheader("🗓️ Crew Attendance & Capacity Adjustments")
         b_date = st.date_input("Select Target Roster Date", value=today, key="attendance_date_picker")
         day_exceptions = roster_df[roster_df['date'] == b_date] if not roster_df.empty else pd.DataFrame(columns=["date", "technician", "avail_type", "dispatcher_notes"])
@@ -1648,9 +2009,10 @@ elif view == "Dispatch Operational Desk":
                 st.session_state.flash_success = f"Status shift recorded for {b_tech}."
                 st.rerun()
 
-    with t_routing:
+    if desk_tab == "Active 3-Day Routing Matrix":
         st.subheader("Visualized Crew Slot Schedule")
-        target_view_day = st.selectbox("Select View Day", [day1, day2, day3], format_func=lambda x: x.strftime("%A, %b %d"))
+        target_view_day, day_idx = select_board_day("dispatcher_routing_day_idx")
+        st.caption("Selected day stays after you save.")
         render_board_color_key()
         
         if bookings_df.empty:
@@ -1728,6 +2090,7 @@ elif view == "Dispatch Operational Desk":
             st.info("No jobs to display in the grid.")
         else:
             viewable_jobs = bookings_df[bookings_df['date'].isin([day1, day2, day3])].copy()
+            viewable_jobs = exclude_standby_jobs(viewable_jobs)
 
             if grid_filter_tech != "All Technicians":
                 viewable_jobs = viewable_jobs[viewable_jobs['technician'] == grid_filter_tech]
@@ -1772,119 +2135,112 @@ elif view == "Dispatch Operational Desk":
             edited_by_date = []
             any_jobs = False
             tech_sections = ["Unassigned"] + capacity_tech_list
-            grid_day_tabs = st.tabs([
-                f"📅 Day 1 · {day1.strftime('%a %b %d')}",
-                f"📆 Day 2 · {day2.strftime('%a %b %d')}",
-                f"🗓️ Day 3 · {day3.strftime('%a %b %d')}",
-            ])
+            target_day = target_view_day
 
-            for day_idx, (grid_tab, target_day) in enumerate(zip(grid_day_tabs, [day1, day2, day3]), start=1):
-                with grid_tab:
-                    grid_day_jobs = viewable_jobs[viewable_jobs['date'] == target_day].copy()
+            grid_day_jobs = viewable_jobs[viewable_jobs['date'] == target_day].copy()
 
-                    if grid_day_jobs.empty:
-                        st.info("No jobs for this day.")
+            if grid_day_jobs.empty:
+                st.info("No jobs for this day.")
+            else:
+                day_metrics = get_detailed_metrics(target_day)
+                sm1, sm2, sm3, sm4 = st.columns(4)
+                sm1.metric("Total Jobs", len(grid_day_jobs))
+                sm2.metric("Unassigned", len(grid_day_jobs[grid_day_jobs['technician'] == "Unassigned"]))
+                sm3.metric("Urgent", len(grid_day_jobs[grid_day_jobs['priority_level'] == "Urgent"]))
+                sm4.metric("Open Slots", f"{int(day_metrics['am_hours_left'] / 2)} AM / {int(day_metrics['pm_hours_left'] / 2)} PM")
+                st.markdown("")
+
+                day_assigned_techs = grid_day_jobs[grid_day_jobs["technician"] != "Unassigned"]["technician"].tolist()
+                day_tech_options = get_assignable_tech_options(target_day, day_assigned_techs)
+                day_grid_column_config = {
+                    **base_grid_column_config,
+                    "technician": st.column_config.SelectboxColumn(
+                        "Technician",
+                        options=day_tech_options,
+                        width="medium",
+                        help="Techs marked OUT for this day are not available to assign.",
+                    ),
+                }
+
+                day_has_jobs = False
+                for tech_idx, tech_name in enumerate(tech_sections):
+                    tech_jobs = grid_day_jobs[grid_day_jobs['technician'] == tech_name].copy()
+                    if tech_jobs.empty:
                         continue
 
-                    day_metrics = get_detailed_metrics(target_day)
-                    sm1, sm2, sm3, sm4 = st.columns(4)
-                    sm1.metric("Total Jobs", len(grid_day_jobs))
-                    sm2.metric("Unassigned", len(grid_day_jobs[grid_day_jobs['technician'] == "Unassigned"]))
-                    sm3.metric("Urgent", len(grid_day_jobs[grid_day_jobs['priority_level'] == "Urgent"]))
-                    sm4.metric("Open Slots", f"{int(day_metrics['am_hours_left'] / 2)} AM / {int(day_metrics['pm_hours_left'] / 2)} PM")
-                    st.markdown("")
+                    day_has_jobs = True
+                    any_jobs = True
+                    tech_jobs["_slot_sort"] = tech_jobs["timeframe"].map(slot_order).fillna(9)
+                    tech_jobs["_priority_sort"] = tech_jobs["priority_level"].map(priority_order).fillna(9)
+                    tech_jobs = tech_jobs.sort_values(["_priority_sort", "_slot_sort"]).drop(columns=["_slot_sort", "_priority_sort"])
 
-                    day_assigned_techs = grid_day_jobs[grid_day_jobs["technician"] != "Unassigned"]["technician"].tolist()
-                    day_tech_options = get_assignable_tech_options(target_day, day_assigned_techs)
-                    day_grid_column_config = {
-                        **base_grid_column_config,
-                        "technician": st.column_config.SelectboxColumn(
-                            "Technician",
-                            options=day_tech_options,
-                            width="medium",
-                            help="Techs marked OUT for this day are not available to assign.",
-                        ),
-                    }
+                    urgent_count = len(tech_jobs[tech_jobs['priority_level'] == "Urgent"])
+                    slot_summary = ", ".join(
+                        f"{slot}: {count}"
+                        for slot, count in tech_jobs['timeframe'].value_counts().items()
+                    )
+                    header_class = "grid-tech-header-unassigned" if tech_name == "Unassigned" else "grid-tech-header-assigned"
+                    header_icon = "⚠️" if tech_name == "Unassigned" else "👤"
+                    urgent_note = f" · {urgent_count} urgent" if urgent_count else ""
 
-                    day_has_jobs = False
-                    for tech_idx, tech_name in enumerate(tech_sections):
-                        tech_jobs = grid_day_jobs[grid_day_jobs['technician'] == tech_name].copy()
-                        if tech_jobs.empty:
-                            continue
-
-                        day_has_jobs = True
-                        any_jobs = True
-                        tech_jobs["_slot_sort"] = tech_jobs["timeframe"].map(slot_order).fillna(9)
-                        tech_jobs["_priority_sort"] = tech_jobs["priority_level"].map(priority_order).fillna(9)
-                        tech_jobs = tech_jobs.sort_values(["_priority_sort", "_slot_sort"]).drop(columns=["_slot_sort", "_priority_sort"])
-
-                        urgent_count = len(tech_jobs[tech_jobs['priority_level'] == "Urgent"])
-                        slot_summary = ", ".join(
-                            f"{slot}: {count}"
-                            for slot, count in tech_jobs['timeframe'].value_counts().items()
-                        )
-                        header_class = "grid-tech-header-unassigned" if tech_name == "Unassigned" else "grid-tech-header-assigned"
-                        header_icon = "⚠️" if tech_name == "Unassigned" else "👤"
-                        urgent_note = f" · {urgent_count} urgent" if urgent_count else ""
-
-                        st.markdown(
-                            f"<div class='grid-tech-header {header_class}'>"
-                            f"<span>{header_icon} {tech_name}</span>"
-                            f"<span class='grid-tech-count'>{len(tech_jobs)} job(s){urgent_note} · {slot_summary}</span>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                        with st.container(border=True):
-                            edited_tech = st.data_editor(
-                                tech_jobs[display_cols],
-                                column_config=day_grid_column_config,
-                                disabled=["customer_job"],
-                                use_container_width=True,
-                                hide_index=True,
-                                key=f"dispatcher_live_grid_d{day_idx}_t{tech_idx}"
-                            )
-                            edited_by_date.append((target_day, edited_tech))
-
-                    warranty_jobs = grid_day_jobs[grid_day_jobs["technician"] == WARRANTY_TECH].copy()
                     st.markdown(
-                        "<div style='font-size:0.78rem;font-weight:700;letter-spacing:0.06em;"
-                        "text-transform:uppercase;color:#c084fc;margin:1rem 0 0.35rem 0;'>"
-                        "🛡️ Warranty Technician (not counted in dispatch capacity)</div>",
+                        f"<div class='grid-tech-header {header_class}'>"
+                        f"<span>{header_icon} {tech_name}</span>"
+                        f"<span class='grid-tech-count'>{len(tech_jobs)} job(s){urgent_note} · {slot_summary}</span>"
+                        f"</div>",
                         unsafe_allow_html=True,
                     )
-                    if warranty_jobs.empty:
-                        st.caption(f"{WARRANTY_TECH} — no warranty jobs on this day.")
-                    else:
-                        day_has_jobs = True
-                        any_jobs = True
-                        warranty_jobs["_slot_sort"] = warranty_jobs["timeframe"].map(slot_order).fillna(9)
-                        warranty_jobs["_priority_sort"] = warranty_jobs["priority_level"].map(priority_order).fillna(9)
-                        warranty_jobs = warranty_jobs.sort_values(["_priority_sort", "_slot_sort"]).drop(columns=["_slot_sort", "_priority_sort"])
-                        slot_summary = ", ".join(
-                            f"{slot}: {count}"
-                            for slot, count in warranty_jobs['timeframe'].value_counts().items()
-                        )
-                        st.markdown(
-                            f"<div class='grid-tech-header grid-tech-header-warranty'>"
-                            f"<span>🛡️ {WARRANTY_TECH}</span>"
-                            f"<span class='grid-tech-count'>{len(warranty_jobs)} warranty job(s) · {slot_summary}</span>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-                        with st.container(border=True):
-                            edited_warranty = st.data_editor(
-                                warranty_jobs[display_cols],
-                                column_config=day_grid_column_config,
-                                disabled=["customer_job"],
-                                use_container_width=True,
-                                hide_index=True,
-                                key=f"dispatcher_live_grid_d{day_idx}_warranty",
-                            )
-                            edited_by_date.append((target_day, edited_warranty))
 
-                    if not day_has_jobs and warranty_jobs.empty:
-                        st.info("No jobs for this day.")
+                    with st.container(border=True):
+                        edited_tech = st.data_editor(
+                            tech_jobs[display_cols],
+                            column_config=day_grid_column_config,
+                            disabled=["customer_job"],
+                            use_container_width=True,
+                            hide_index=True,
+                            key=f"dispatcher_live_grid_d{day_idx}_t{tech_idx}"
+                        )
+                        edited_by_date.append((target_day, edited_tech))
+
+                warranty_jobs = grid_day_jobs[grid_day_jobs["technician"] == WARRANTY_TECH].copy()
+                st.markdown(
+                    "<div style='font-size:0.78rem;font-weight:700;letter-spacing:0.06em;"
+                    "text-transform:uppercase;color:#c084fc;margin:1rem 0 0.35rem 0;'>"
+                    "🛡️ Warranty Technician (not counted in dispatch capacity)</div>",
+                    unsafe_allow_html=True,
+                )
+                if warranty_jobs.empty:
+                    st.caption(f"{WARRANTY_TECH} — no warranty jobs on this day.")
+                else:
+                    day_has_jobs = True
+                    any_jobs = True
+                    warranty_jobs["_slot_sort"] = warranty_jobs["timeframe"].map(slot_order).fillna(9)
+                    warranty_jobs["_priority_sort"] = warranty_jobs["priority_level"].map(priority_order).fillna(9)
+                    warranty_jobs = warranty_jobs.sort_values(["_priority_sort", "_slot_sort"]).drop(columns=["_slot_sort", "_priority_sort"])
+                    slot_summary = ", ".join(
+                        f"{slot}: {count}"
+                        for slot, count in warranty_jobs['timeframe'].value_counts().items()
+                    )
+                    st.markdown(
+                        f"<div class='grid-tech-header grid-tech-header-warranty'>"
+                        f"<span>🛡️ {WARRANTY_TECH}</span>"
+                        f"<span class='grid-tech-count'>{len(warranty_jobs)} warranty job(s) · {slot_summary}</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    with st.container(border=True):
+                        edited_warranty = st.data_editor(
+                            warranty_jobs[display_cols],
+                            column_config=day_grid_column_config,
+                            disabled=["customer_job"],
+                            use_container_width=True,
+                            hide_index=True,
+                            key=f"dispatcher_live_grid_d{day_idx}_warranty",
+                        )
+                        edited_by_date.append((target_day, edited_warranty))
+
+                if not day_has_jobs and warranty_jobs.empty:
+                    st.info("No jobs for this day.")
 
             if not any_jobs:
                 st.info("No jobs match the current filters.")
@@ -1895,7 +2251,7 @@ elif view == "Dispatch Operational Desk":
                 with save_col1:
                     save_grid = st.button("💾 Save Grid Adjustments", type="primary", use_container_width=True)
                 with save_col2:
-                    st.caption("Changes across all day tabs are saved together.")
+                    st.caption("Saves edits for the day currently selected above.")
 
             if any_jobs and save_grid:
                 conn = get_db_connection()
@@ -1920,37 +2276,216 @@ elif view == "Live Summary Board":
     st.subheader("🦅 Master 3-Day Huddle Snapshot Board")
     st.caption("Job bubbles span across the slots they occupy (e.g. 4 hrs starting AM 1 covers AM 1 + AM 2).")
     render_board_color_key()
-    
-    t1, t2, t3 = st.tabs([
-        f"📅 TODAY ({day1.strftime('%A, %b %d')})",
-        f"📆 TOMORROW ({day2.strftime('%A, %b %d')})",
-        f"🗓️ {day3.strftime('%A, %b %d')}"
-    ])
 
-    target_days = [
-        {"tab": t1, "date": day1},
-        {"tab": t2, "date": day2},
-        {"tab": t3, "date": day3}
-    ]
-    
-    for day_obj in target_days:
-        with day_obj["tab"]:
-            metrics = get_detailed_metrics(day_obj["date"])
-            
-            m_col1, m_col2, m_col3 = st.columns(3)
-            m_col1.markdown(f"🟢 **AM Slots Remaining:** `{int(metrics['am_hours_left'] / 2)} Slots`")
-            m_col2.markdown(f"🔵 **PM Slots Remaining:** `{int(metrics['pm_hours_left'] / 2)} Slots`")
-            m_col3.markdown(f"📊 **Total Schedule Load:** `{metrics['total_jobs_booked']} / {metrics['max_jobs_allowed']} Calls`")
-            st.markdown("---")
-            
-            if not bookings_df.empty:
-                current_day_jobs = filter_board_jobs(bookings_df[bookings_df['date'] == day_obj["date"]]).copy()
+    target_date, _ = select_board_day("live_summary_day_idx")
+    metrics = get_detailed_metrics(target_date)
+
+    m_col1, m_col2, m_col3 = st.columns(3)
+    m_col1.markdown(f"🟢 **AM Slots Remaining:** `{int(metrics['am_hours_left'] / 2)} Slots`")
+    m_col2.markdown(f"🔵 **PM Slots Remaining:** `{int(metrics['pm_hours_left'] / 2)} Slots`")
+    m_col3.markdown(f"📊 **Total Schedule Load:** `{metrics['total_jobs_booked']} / {metrics['max_jobs_allowed']} Calls`")
+    st.markdown("---")
+
+    if not bookings_df.empty:
+        current_day_jobs = filter_board_jobs(bookings_df[bookings_df['date'] == target_date]).copy()
+    else:
+        current_day_jobs = pd.DataFrame()
+
+    visible_techs = render_dispatch_crew_sections(target_date, current_day_jobs)
+
+    if visible_techs:
+        st.divider()
+    render_warranty_board_section(target_date, current_day_jobs)
+
+# -------------------------------------------------------------
+# 6. PAST SCHEDULED JOBS (ST REPORT + LOCAL BOARD)
+# -------------------------------------------------------------
+elif view == "Past Scheduled Jobs":
+    st.header("🗂️ Jobs Scheduled in the Past")
+    st.caption(
+        "Same idea as the ServiceTitan **Jobs scheduled in past** report — jobs that were scheduled "
+        "but never completed. Prefer **Pull from ServiceTitan API**; CSV import is still available as a backup."
+    )
+
+    board_past = get_board_past_incomplete_jobs(bookings_df)
+    imported_past = load_past_scheduled_jobs()
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Open on this board (past dates)", len(board_past))
+    m2.metric("From ServiceTitan (open)", len(imported_past))
+    m3.metric("ST API", "Ready" if st_api.is_configured() else "Not configured")
+
+    st.markdown("---")
+    st.subheader("🔌 Pull from ServiceTitan API")
+    if not st_api.is_configured():
+        st.warning(
+            "Add your ServiceTitan credentials to **`.streamlit/secrets.toml`** "
+            "(copy from `.streamlit/secrets.toml.example`). "
+            "You need: `client_id`, `client_secret`, `app_key`, and `tenant_id`."
+        )
+        with st.expander("How to get API credentials"):
+            st.markdown(
+                """
+1. Confirm your ServiceTitan plan includes **API access** (ask your ST admin / account rep if unsure).
+2. In the [ServiceTitan Developer Portal](https://developer.servicetitan.io/), create or open your app → copy the **App Key**.
+3. In ServiceTitan → **Settings → Integrations / API Application Access**, connect that app and copy the **Client ID**, **Client Secret**, and **Tenant ID**.
+4. Paste them into `.streamlit/secrets.toml`, then restart Streamlit.
+                """
+            )
+    else:
+        lookback = st.slider("Look back how many days?", min_value=14, max_value=365, value=120, step=7)
+        c_test, c_pull = st.columns(2)
+        with c_test:
+            if st.button("Test ST connection", use_container_width=True):
+                try:
+                    msg = st_api.test_connection()
+                    st.success(msg)
+                except st_api.ServiceTitanError as exc:
+                    st.error(str(exc))
+        with c_pull:
+            pull_clicked = st.button("⬇️ Pull past scheduled jobs from ST", type="primary", use_container_width=True)
+        if pull_clicked:
+            try:
+                with st.spinner("Talking to ServiceTitan…"):
+                    rows = st_api.fetch_past_scheduled_jobs(lookback_days=lookback)
+                if not rows:
+                    st.warning("API returned no open past-scheduled jobs for that lookback window.")
+                else:
+                    conn = get_db_connection()
+                    imported_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    for row in rows:
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO Past_Scheduled_Jobs
+                            (id, job_number, customer_name, scheduled_date, job_type, technician, status, notes, source, imported_at, resolved)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'st_api', ?, 0)
+                            """,
+                            (
+                                row["id"], row["job_number"], row["customer_name"], row["scheduled_date"],
+                                row["job_type"], row["technician"], row["status"], row["notes"], imported_at,
+                            ),
+                        )
+                    conn.commit()
+                    conn.close()
+                    st.session_state.flash_success = f"Pulled {len(rows)} past-scheduled job(s) from ServiceTitan."
+                    st.rerun()
+            except st_api.ServiceTitanError as exc:
+                st.error(str(exc))
+
+    st.markdown("---")
+    st.subheader("📥 Backup: Import ServiceTitan Report (CSV)")
+    st.markdown(
+        "If API access is not ready yet, export **Jobs scheduled in past** from ST as CSV and upload below. "
+        "Common columns like Job #, Customer, Appointment/Scheduled Date, Job Type, Technician, and Status are auto-mapped."
+    )
+    uploaded = st.file_uploader("Upload ST report CSV", type=["csv"], key="past_jobs_csv_upload")
+    if uploaded is not None:
+        try:
+            raw_csv = pd.read_csv(uploaded)
+            preview = normalize_past_jobs_csv(raw_csv)
+            st.write(f"Detected **{len(preview)}** row(s) from upload.")
+            if preview.empty:
+                st.warning("Could not map rows — check that the CSV has customer and/or job number columns.")
+                with st.expander("Raw CSV columns found"):
+                    st.write(list(raw_csv.columns))
             else:
-                current_day_jobs = pd.DataFrame()
+                st.dataframe(preview.head(20), use_container_width=True, hide_index=True)
+                if st.button("💾 Import these jobs into Past Scheduled list", type="primary"):
+                    conn = get_db_connection()
+                    imported_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    for _, row in preview.iterrows():
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO Past_Scheduled_Jobs
+                            (id, job_number, customer_name, scheduled_date, job_type, technician, status, notes, source, imported_at, resolved)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'st_csv', ?, 0)
+                            """,
+                            (
+                                row["id"], row["job_number"], row["customer_name"], row["scheduled_date"],
+                                row["job_type"], row["technician"], row["status"], row["notes"], imported_at,
+                            ),
+                        )
+                    conn.commit()
+                    conn.close()
+                    st.session_state.flash_success = f"Imported {len(preview)} job(s) from ServiceTitan CSV."
+                    st.rerun()
+        except Exception as exc:
+            st.error(f"Could not read that CSV: {exc}")
 
-            target_date = day_obj["date"]
-            visible_techs = render_dispatch_crew_sections(target_date, current_day_jobs)
+    st.markdown("---")
+    st.subheader("📋 From ServiceTitan (API or CSV)")
+    if imported_past.empty:
+        st.info("No ServiceTitan past-scheduled jobs loaded yet. Use **Pull from ServiceTitan API** or upload a CSV.")
+    else:
+        show_cols = ["job_number", "customer_name", "scheduled_date", "job_type", "technician", "status", "notes", "source", "imported_at"]
+        available = [c for c in show_cols if c in imported_past.columns]
+        st.dataframe(
+            imported_past[available],
+            column_config={
+                "job_number": st.column_config.TextColumn("Job #"),
+                "customer_name": st.column_config.TextColumn("Customer"),
+                "scheduled_date": st.column_config.DateColumn("Scheduled Date", format="MM/DD/YYYY"),
+                "job_type": st.column_config.TextColumn("Job Type"),
+                "technician": st.column_config.TextColumn("Technician"),
+                "status": st.column_config.TextColumn("Status"),
+                "notes": st.column_config.TextColumn("Notes", width="large"),
+                "source": st.column_config.TextColumn("Source"),
+                "imported_at": st.column_config.TextColumn("Pulled / Imported At"),
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+        resolve_options = {
+            f"{row['customer_name']} · {row['job_number']} · {row['scheduled_date']}": row["id"]
+            for _, row in imported_past.iterrows()
+        }
+        with st.form("resolve_past_import_form"):
+            pick = st.selectbox("Mark imported job as resolved / handled:", options=list(resolve_options.keys()))
+            if st.form_submit_button("✅ Mark Resolved"):
+                conn = get_db_connection()
+                conn.execute("UPDATE Past_Scheduled_Jobs SET resolved = 1 WHERE id = ?", (resolve_options[pick],))
+                conn.commit()
+                conn.close()
+                st.session_state.flash_success = f"Marked resolved: {pick}"
+                st.rerun()
 
-            if visible_techs:
-                st.divider()
-            render_warranty_board_section(target_date, current_day_jobs)
+    st.markdown("---")
+    st.subheader("📌 From this board (past date, still open)")
+    st.caption("Jobs on Beola scheduled before today with status Booked, Scheduled, or Dispatched.")
+    if board_past.empty:
+        st.success("No past incomplete jobs on this board.")
+    else:
+        board_editor = st.data_editor(
+            board_past[[
+                "id", "date", "customer_job", "technician", "status", "priority_level",
+                "timeframe", "job_type", "notes",
+            ]],
+            column_config={
+                "id": None,
+                "date": st.column_config.DateColumn("Scheduled Date", format="MM/DD/YYYY"),
+                "customer_job": st.column_config.TextColumn("Customer / Job"),
+                "technician": st.column_config.SelectboxColumn(
+                    "Technician", options=["Unassigned"] + tech_list
+                ),
+                "status": st.column_config.SelectboxColumn("Status", options=JOB_STATUSES),
+                "priority_level": st.column_config.TextColumn("Priority", disabled=True),
+                "timeframe": st.column_config.TextColumn("Slot", disabled=True),
+                "job_type": st.column_config.TextColumn("Job Type", disabled=True),
+                "notes": st.column_config.TextColumn("Notes", width="large"),
+            },
+            disabled=["customer_job", "priority_level", "timeframe", "job_type"],
+            use_container_width=True,
+            hide_index=True,
+            key="board_past_incomplete_editor",
+        )
+        if st.button("💾 Save Board Past-Job Updates", type="primary"):
+            conn = get_db_connection()
+            for _, row in board_editor.iterrows():
+                conn.execute(
+                    "UPDATE Booking_Log SET technician = ?, status = ?, notes = ? WHERE id = ?",
+                    (row["technician"], row["status"], row["notes"], str(row["id"])),
+                )
+            conn.commit()
+            conn.close()
+            st.session_state.flash_success = "Past board jobs updated."
+            st.rerun()
