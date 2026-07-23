@@ -95,12 +95,103 @@ def init_db():
 init_db()
 
 # Global Configurations
-capacity_tech_list = ["Eddie Glenn", "Derek Moore", "Ken Wilburn", "Austin Baker", "RJ Oyanib"]
+capacity_tech_list = [
+    "Eddie Glenn", "Derek Moore", "Ken Wilburn", "Austin Baker", "RJ Oyanib", "Tony Brown",
+]
 WARRANTY_TECH = "Kevin Winland"
 tech_list = capacity_tech_list + [WARRANTY_TECH]
 
+# Regular work days by technician (weekday names). Warranty tech is tracked separately.
+# RJ: Saturday–Wednesday. Other dispatch techs: Monday–Friday.
+# Sat/Sun: RJ is always scheduled; the 2nd weekend seat rotates (not a fixed person).
+WEEKEND_DAYS = {"Saturday", "Sunday"}
+WEEKEND_ROTATING_CAPACITY = 1  # second weekend tech rotates among the Mon–Fri crew
+
+DEFAULT_TECH_JOB_CAP = 4
+DEFAULT_TECH_AM_HOURS = 4
+DEFAULT_TECH_PM_HOURS = 4
+
+# Per-tech daily job caps (others default to 4). Tony runs a lighter 3-job day.
+TECH_JOB_CAPS = {
+    "Tony Brown": 3,
+}
+# Hour blocks align with job caps (Tony: 3 hrs AM + 3 hrs PM).
+TECH_AM_HOURS = {
+    "Tony Brown": 3,
+}
+TECH_PM_HOURS = {
+    "Tony Brown": 3,
+}
+
+TECH_WORK_DAYS = {
+    "Eddie Glenn": {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"},
+    "Derek Moore": {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"},
+    "Ken Wilburn": {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"},
+    "Austin Baker": {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"},
+    "Tony Brown": {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"},
+    "RJ Oyanib": {"Saturday", "Sunday", "Monday", "Tuesday", "Wednesday"},
+}
+
 def is_warranty_technician(tech):
     return tech == WARRANTY_TECH
+
+def get_tech_job_cap(tech):
+    return TECH_JOB_CAPS.get(tech, DEFAULT_TECH_JOB_CAP)
+
+def get_tech_am_hours(tech):
+    return TECH_AM_HOURS.get(tech, DEFAULT_TECH_AM_HOURS)
+
+def get_tech_pm_hours(tech):
+    return TECH_PM_HOURS.get(tech, DEFAULT_TECH_PM_HOURS)
+
+def tech_works_on_date(tech, target_date):
+    """Whether a capacity tech is on their fixed regular schedule for this date."""
+    if is_warranty_technician(tech):
+        return True
+    work_days = TECH_WORK_DAYS.get(tech)
+    if work_days is None:
+        return True
+    return target_date.strftime("%A") in work_days
+
+def tech_in_weekend_rotate_pool(tech, target_date):
+    """Mon–Fri dispatch techs may fill the rotating 2nd weekend seat."""
+    day_name = target_date.strftime("%A")
+    if day_name not in WEEKEND_DAYS:
+        return False
+    if is_warranty_technician(tech) or tech not in capacity_tech_list:
+        return False
+    # RJ is already on the fixed weekend schedule; others are the rotate pool
+    return not tech_works_on_date(tech, target_date)
+
+def tech_available_by_schedule(tech, target_date):
+    """Assignable by schedule: fixed work day, or weekend rotate pool."""
+    if is_warranty_technician(tech):
+        return True
+    return tech_works_on_date(tech, target_date) or tech_in_weekend_rotate_pool(tech, target_date)
+
+def get_scheduled_capacity_techs(target_date):
+    """Named dispatch techs on their fixed schedule for this weekday."""
+    return [tech for tech in capacity_tech_list if tech_works_on_date(tech, target_date)]
+
+def get_capacity_headcount(target_date):
+    """Named + rotating weekend seats (for priority-tier banding)."""
+    count = len(get_scheduled_capacity_techs(target_date))
+    if target_date.strftime("%A") in WEEKEND_DAYS:
+        count += WEEKEND_ROTATING_CAPACITY
+    return count
+
+def get_day_capacity_budget(target_date):
+    """Sum AM/PM hours and max jobs from each scheduled tech's personal cap."""
+    scheduled = get_scheduled_capacity_techs(target_date)
+    total_am = sum(get_tech_am_hours(tech) for tech in scheduled)
+    total_pm = sum(get_tech_pm_hours(tech) for tech in scheduled)
+    max_jobs = sum(get_tech_job_cap(tech) for tech in scheduled)
+    if target_date.strftime("%A") in WEEKEND_DAYS:
+        # Floating weekend seat uses the standard 4-job / 4+4 hr profile
+        total_am += DEFAULT_TECH_AM_HOURS
+        total_pm += DEFAULT_TECH_PM_HOURS
+        max_jobs += DEFAULT_TECH_JOB_CAP
+    return total_am, total_pm, max_jobs, scheduled
 
 def job_counts_toward_capacity(job):
     """Warranty-route jobs on Kevin do not consume dispatch board capacity."""
@@ -619,6 +710,23 @@ roster_df = load_roster()
 
 def get_tech_roster_info(target_date, tech):
     """Return availability info for a tech on a given date."""
+    day_name = target_date.strftime("%A")
+    in_rotate_pool = tech_in_weekend_rotate_pool(tech, target_date)
+
+    # Fixed off-day (e.g. RJ Thu/Fri, or weekday tech with no weekend rotate role)
+    if not is_warranty_technician(tech) and not tech_available_by_schedule(tech, target_date):
+        return {
+            "avail_type": "Off Schedule",
+            "am_hours": 0,
+            "pm_hours": 0,
+            "notes": "Not on regular schedule this day",
+            "is_modified": True,
+            "is_full_day_out": True,
+            "is_assignable": False,
+            "badge": "📅 OFF SCHEDULE",
+            "is_off_schedule": True,
+        }
+
     if not roster_df.empty:
         match = roster_df[(roster_df["date"] == target_date) & (roster_df["technician"] == tech)]
         if not match.empty:
@@ -649,7 +757,22 @@ def get_tech_roster_info(target_date, tech):
                 "is_full_day_out": is_full_out,
                 "is_assignable": not is_full_out,
                 "badge": badge,
+                "is_off_schedule": False,
             }
+
+    if in_rotate_pool:
+        return {
+            "avail_type": "Weekend Rotate Pool",
+            "am_hours": 4,
+            "pm_hours": 4,
+            "notes": "Eligible for rotating 2nd weekend seat (not a fixed assignment)",
+            "is_modified": True,
+            "is_full_day_out": False,
+            "is_assignable": True,
+            "badge": "🔄 WEEKEND ROTATE",
+            "is_off_schedule": False,
+        }
+
     return {
         "avail_type": "Active",
         "am_hours": 4,
@@ -659,6 +782,7 @@ def get_tech_roster_info(target_date, tech):
         "is_full_day_out": False,
         "is_assignable": True,
         "badge": "🟢 ACTIVE",
+        "is_off_schedule": False,
     }
 
 def get_assignable_tech_options(target_date, keep_techs=None):
@@ -751,7 +875,13 @@ def render_dispatch_crew_sections(target_date, day_jobs, *, include_unassigned=T
     for tech in capacity_tech_list:
         tech_jobs_for_day = day_jobs[day_jobs["technician"] == tech] if not day_jobs.empty else pd.DataFrame()
         roster_info = get_tech_roster_info(target_date, tech)
-        if (not day_jobs.empty and not tech_jobs_for_day.empty) or roster_info["is_full_day_out"]:
+        # Always show techs on their fixed schedule (even with an open day), plus anyone out or with jobs
+        show_tech = (
+            (not tech_jobs_for_day.empty)
+            or roster_info["is_full_day_out"]
+            or tech_works_on_date(tech, target_date)
+        )
+        if show_tech:
             visible_crew_techs.append(tech)
 
     for tech_idx, current_tech in enumerate(visible_crew_techs):
@@ -828,45 +958,60 @@ def render_callout_board(target_days):
 # DYNAMIC METRIC, HOUR, & CAP CALCULATOR
 # -------------------------------------------------------------
 def get_detailed_metrics(target_date):
+    scheduled_techs = get_scheduled_capacity_techs(target_date)
+    base_tech_count = get_capacity_headcount(target_date)
     day_name = target_date.strftime("%A")
+    is_weekend = day_name in WEEKEND_DAYS
 
-    if day_name in ["Monday", "Tuesday"]:
-        base_tech_count = 5
+    # Priority tier allotments scale with how many dispatch seats are open
+    if base_tech_count >= 5:
         day_caps = {"Urgent": 4, "High": 9, "Normal": 5, "Low": 3}
-    elif day_name in ["Wednesday", "Thursday", "Friday"]:
-        base_tech_count = 4
+    elif base_tech_count >= 4:
         day_caps = {"Urgent": 3, "High": 7, "Normal": 4, "Low": 2}
-    else:  # Saturday and Sunday
-        base_tech_count = 2
+    elif base_tech_count >= 2:
         day_caps = {"Urgent": 1, "High": 2, "Normal": 2, "Low": 0}
+    elif base_tech_count == 1:
+        day_caps = {"Urgent": 1, "High": 1, "Normal": 1, "Low": 0}
+    else:
+        day_caps = {"Urgent": 0, "High": 0, "Normal": 0, "Low": 0}
 
-    total_am_hours = base_tech_count * 4
-    total_pm_hours = base_tech_count * 4
-    max_jobs_allowed = base_tech_count * 4
+    total_am_hours, total_pm_hours, max_jobs_allowed, _ = get_day_capacity_budget(target_date)
     base_max_jobs = max_jobs_allowed
+
+    # Weekday: only fixed-schedule techs can reduce capacity via PTO.
+    # Weekend: RJ (fixed) + any rotate-pool tech marked out can reduce capacity.
+    roster_eligible = set(scheduled_techs)
+    if is_weekend:
+        roster_eligible = set(capacity_tech_list)
     
     if not roster_df.empty:
         day_roster = roster_df[roster_df['date'] == target_date]
         for _, change in day_roster.iterrows():
-            if change['technician'] not in capacity_tech_list:
+            tech_name = change['technician']
+            if tech_name not in roster_eligible:
                 continue
             status = change['avail_type']
+            tech_am = get_tech_am_hours(tech_name)
+            tech_pm = get_tech_pm_hours(tech_name)
+            tech_jobs = get_tech_job_cap(tech_name)
             
             if status in ["PTO Full", "Call Out"]:
-                total_am_hours -= 4
-                total_pm_hours -= 4
-                max_jobs_allowed -= 4
+                total_am_hours -= tech_am
+                total_pm_hours -= tech_pm
+                max_jobs_allowed -= tech_jobs
             elif "AM off" in status:
-                total_am_hours -= 4
-                max_jobs_allowed -= 2
+                total_am_hours -= tech_am
+                max_jobs_allowed -= max(1, tech_jobs // 2)
             elif "PM off" in status:
-                total_pm_hours -= 4
-                max_jobs_allowed -= 2
+                total_pm_hours -= tech_pm
+                max_jobs_allowed -= max(1, tech_jobs // 2)
             elif status == "Training/Meeting":
-                total_am_hours -= 2
-                total_pm_hours -= 2
+                total_am_hours -= max(1, tech_am // 2)
+                total_pm_hours -= max(1, tech_pm // 2)
 
     max_jobs_allowed = max(0, max_jobs_allowed)
+    total_am_hours = max(0, total_am_hours)
+    total_pm_hours = max(0, total_pm_hours)
     if base_max_jobs > 0 and max_jobs_allowed < base_max_jobs:
         capacity_ratio = max_jobs_allowed / base_max_jobs
         day_caps = {tier: max(0, round(cap * capacity_ratio)) for tier, cap in day_caps.items()}
@@ -1207,7 +1352,17 @@ if view == "CSR Booking & Standby Hub":
                 st.markdown(f"**Total Board Run Count:** `{job_status}`")
                 
                 with st.expander("View Priority Limits Filled"):
-                    st.caption("Priority tier limits scale down when dispatch techs are out (PTO, call-out, half-day). Warranty jobs on Kevin Winland are excluded from these counts.")
+                    scheduled = get_scheduled_capacity_techs(d)
+                    headcount = get_capacity_headcount(d)
+                    weekend_note = (
+                        f" · +{WEEKEND_ROTATING_CAPACITY} rotating weekend seat"
+                        if d.strftime("%A") in WEEKEND_DAYS else ""
+                    )
+                    st.caption(
+                        f"Capacity seats: **{headcount}** "
+                        f"(fixed: {', '.join(scheduled) if scheduled else 'none'}{weekend_note}). "
+                        "RJ Sat–Wed · Tony Mon–Fri (3-job cap) · Sat/Sun 2nd seat rotates · Kevin excluded."
+                    )
                     for p_tier, cap in metrics["day_caps"].items():
                         current_count = metrics["priority_counts"][p_tier]
                         status_text = "🔴 SOLD OUT" if current_count >= cap else f"{current_count} / {cap} booked"
@@ -1925,30 +2080,49 @@ elif view == "Dispatch Operational Desk":
     
     if desk_tab == "Tech Attendance & Availability":
         st.subheader("🗓️ Crew Attendance & Capacity Adjustments")
+        st.caption(
+            "RJ Oyanib: **Sat–Wed**. Tony Brown: **Mon–Fri**, **3-job daily cap**. "
+            "Other dispatch techs: **Mon–Fri**, 4-job cap. "
+            "Sat/Sun = RJ + **1 rotating seat**. Thu/Fri RJ is off schedule."
+        )
         b_date = st.date_input("Select Target Roster Date", value=today, key="attendance_date_picker")
         day_exceptions = roster_df[roster_df['date'] == b_date] if not roster_df.empty else pd.DataFrame(columns=["date", "technician", "avail_type", "dispatcher_notes"])
         
         roster_status_list = []
         for tech in tech_list:
             warranty_tech = is_warranty_technician(tech)
+            on_schedule = tech_works_on_date(tech, b_date) if not warranty_tech else True
             if not day_exceptions.empty and 'technician' in day_exceptions.columns:
                 tech_exc = day_exceptions[day_exceptions['technician'] == tech]
             else:
                 tech_exc = pd.DataFrame()
             
-            if not tech_exc.empty:
+            if not on_schedule and not tech_in_weekend_rotate_pool(tech, b_date):
+                current_status = "📅 Off Schedule"
+                am_disp, pm_disp = "0 hrs", "0 hrs"
+                notes = "Regular schedule does not include this day"
+                is_modified = False
+            elif tech_in_weekend_rotate_pool(tech, b_date) and tech_exc.empty:
+                current_status = "🔄 Weekend Rotate Pool"
+                am_disp, pm_disp = f"{DEFAULT_TECH_AM_HOURS} hrs", f"{DEFAULT_TECH_PM_HOURS} hrs"
+                notes = "Eligible for rotating 2nd weekend seat"
+                is_modified = False
+            elif not tech_exc.empty:
                 current_status = tech_exc.iloc[0]['avail_type']
                 notes = tech_exc.iloc[0]['dispatcher_notes']
                 is_modified = True
                 if current_status in ["PTO Full", "Call Out"]: am_disp, pm_disp = "0 hrs", "0 hrs"
-                elif "AM off" in current_status: am_disp, pm_disp = "0 hrs", "4 hrs"
-                elif "PM off" in current_status: am_disp, pm_disp = "4 hrs", "0 hrs"
-                elif current_status == "Training/Meeting": am_disp, pm_disp = "2 hrs", "2 hrs"
-                else: am_disp, pm_disp = "4 hrs", "4 hrs"
+                elif "AM off" in current_status: am_disp, pm_disp = "0 hrs", f"{get_tech_pm_hours(tech)} hrs"
+                elif "PM off" in current_status: am_disp, pm_disp = f"{get_tech_am_hours(tech)} hrs", "0 hrs"
+                elif current_status == "Training/Meeting":
+                    am_disp = f"{max(1, get_tech_am_hours(tech) // 2)} hrs"
+                    pm_disp = f"{max(1, get_tech_pm_hours(tech) // 2)} hrs"
+                else: am_disp, pm_disp = f"{get_tech_am_hours(tech)} hrs", f"{get_tech_pm_hours(tech)} hrs"
             else:
                 current_status = "🟢 Active / Working"
-                am_disp, pm_disp = "4 hrs", "4 hrs"
-                notes = "Standard Schedule"
+                am_disp, pm_disp = f"{get_tech_am_hours(tech)} hrs", f"{get_tech_pm_hours(tech)} hrs"
+                job_cap = get_tech_job_cap(tech)
+                notes = f"Standard Schedule · {job_cap}-job daily cap"
                 is_modified = False
 
             if warranty_tech:
